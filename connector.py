@@ -40,23 +40,27 @@ LOOKUP_TABLES = [
 ]
 
 
-# Fields whose values can change type between records (e.g. custom_fields value: str vs int vs null).
-# Serializing them to JSON strings prevents DuckDB type-inference conflicts.
-_JSON_FIELDS = frozenset({
-    "custom_fields",
-    "keyed_custom_fields",
-    "demographic_answers",
-})
+def _safe_str(v: str) -> str:
+    """Replace invalid UTF-8 sequences so DuckDB can store the string."""
+    return v.encode("utf-8", errors="replace").decode("utf-8")
 
 
 def normalize_record(record: dict) -> dict:
-    """Serialize variable-type nested fields to JSON strings."""
-    if not any(k in record for k in _JSON_FIELDS):
-        return record
-    out = dict(record)
-    for field in _JSON_FIELDS:
-        if field in out and out[field] is not None:
-            out[field] = json.dumps(out[field])
+    """Serialize all nested dicts/lists to JSON strings and sanitize strings.
+
+    The Greenhouse API returns highly variable nested structures (custom_fields,
+    phone_numbers, addresses, tags, etc.) whose value types can differ between
+    records. Serializing them prevents DuckDB type-inference conflicts at scale.
+    Old records can also contain invalid UTF-8 sequences that DuckDB rejects.
+    """
+    out = {}
+    for k, v in record.items():
+        if isinstance(v, (dict, list)):
+            out[k] = json.dumps(v, ensure_ascii=True)
+        elif isinstance(v, str):
+            out[k] = _safe_str(v)
+        else:
+            out[k] = v
     return out
 
 
@@ -92,14 +96,21 @@ def fetch_page(
     configuration: dict,
     params: dict | None = None,
 ) -> tuple[list, str | None, str]:
-    """GET one page. Handles token refresh (401), rate limits (429), and server errors (5xx)."""
+    """GET one page. Handles token refresh (401), rate limits (429), server errors (5xx),
+    and transient network errors (connection reset, timeout)."""
     for attempt in range(5):
-        resp = requests.get(
-            url,
-            headers={"Authorization": f"Bearer {token}"},
-            params=params,
-            timeout=60,
-        )
+        try:
+            resp = requests.get(
+                url,
+                headers={"Authorization": f"Bearer {token}"},
+                params=params,
+                timeout=60,
+            )
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            wait = 2 ** attempt
+            log.warning(f"Network error ({e.__class__.__name__}) — retrying in {wait}s")
+            time.sleep(wait)
+            continue
 
         if resp.status_code == 401:
             log.warning("Access token expired — refreshing")
@@ -205,10 +216,15 @@ def update(configuration: dict, state: dict):
     if test_mode:
         log.warning("Running in test mode — only first page per table will be synced")
 
+    start_date = configuration.get("start_date")  # e.g. "2020-01-01T00:00:00Z"
+    if start_date:
+        log.info(f"start_date set — historical sync limited to records updated after {start_date}")
+
     new_state = dict(state)
 
     for table, endpoint in INCREMENTAL_TABLES:
-        last_updated_at = state.get(f"{table}_updated_at")
+        # Use saved high-watermark, falling back to start_date for first sync
+        last_updated_at = state.get(f"{table}_updated_at") or start_date
         new_ts, token = sync_incremental(table, endpoint, token, configuration, last_updated_at, test_mode)
         if new_ts:
             new_state[f"{table}_updated_at"] = new_ts
